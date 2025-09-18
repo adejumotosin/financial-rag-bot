@@ -1,6 +1,7 @@
 import streamlit as st 
 import numpy as np 
-import faiss import pickle 
+import faiss 
+import pickle 
 import os from io 
 import BytesIO 
 from pdfminer.high_level import extract_text
