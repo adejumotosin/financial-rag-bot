@@ -3,15 +3,17 @@ import numpy as np
 import faiss
 import pickle
 import os
+import json
+import re
+import hashlib
 from io import BytesIO
+from datetime import datetime
 from pdfminer.high_level import extract_text
 from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
-import re
-from datetime import datetime
-import hashlib
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from typing import List, Dict, Any
+import pandas as pd
 
 # =========================
 # CONFIG
@@ -302,6 +304,61 @@ ANSWER:
                 answer = highlight_numbers(answer)
 
                 st.session_state.history.append((query, answer, chunks))
+
+# =========================
+# FINANCIAL EXTRACTION TO CSV
+# =========================
+st.markdown("---")
+if st.button("📥 Extract Financials to CSV"):
+    if not bot.metadata:
+        st.warning("Please upload at least one financial report first.")
+    else:
+        with st.spinner("Extracting structured financials..."):
+            context_with_sources = "\n\n".join([
+                f"--- Source: {chunk['company']} ---\n{chunk['content']}"
+                for chunk in bot.metadata[:50]  # limit for performance
+            ])
+
+            extraction_prompt = f"""
+You are a financial data extractor. From the context below, identify key financial metrics.
+Return ONLY valid JSON with this schema:
+[
+  {{
+    "Company": "string",
+    "Quarter": "string",
+    "Revenue": "number (in billions if possible)",
+    "OperatingIncome": "number",
+    "OperatingMargin": "percentage",
+    "NetIncome": "number",
+    "EPS": "number",
+    "ComparableEPS": "number"
+  }}
+]
+
+CONTEXT:
+{context_with_sources}
+"""
+
+            raw_json, _ = bot.generate_with_gemini(extraction_prompt, max_tokens=800)
+
+            try:
+                data = json.loads(raw_json)
+                df = pd.DataFrame(data)
+                st.success("✅ Extracted financials successfully!")
+
+                st.dataframe(df)
+
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    label="📊 Download as CSV",
+                    data=csv,
+                    file_name="financials.csv",
+                    mime="text/csv",
+                )
+            except Exception as e:
+                st.error(f"❌ Failed to parse financial data: {str(e)}")
+                st.text("Raw output:")
+                st.code(raw_json)
 
 # =========================
 # CHAT HISTORY
