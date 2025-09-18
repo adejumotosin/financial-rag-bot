@@ -1,53 +1,59 @@
-# app.py
-import os
-import re
-import json
-import faiss
-import faiss  # ensure faiss or faiss-cpu is installed in environment
-import pickle
-import base64
-import hashlib
-import numpy as np
-import pandas as pd
 import streamlit as st
+import numpy as np
+import faiss
+import pickle
+import os
 from io import BytesIO
-from datetime import datetime
-from typing import List, Dict, Any, Tuple, Optional
-
-# PDF / embeddings / LLM
 from pdfminer.high_level import extract_text
 from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
-
-# optional: langchain splitter (nice but not required)
-try:
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-    _HAS_LANGCHAIN = True
-except Exception:
-    _HAS_LANGCHAIN = False
+import re
+from datetime import datetime
+import hashlib
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from typing import List, Dict, Any
 
 # =========================
 # CONFIG
 # =========================
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-EMBEDDING_DIM = 384  # fallback; will be updated from model.get_sentence_embedding_dimension()
 INDEX_PATH = "financial_index/faiss_index.bin"
 METADATA_PATH = "financial_index/metadata.pkl"
 EMBEDDING_CACHE_PATH = "financial_index/embedding_cache.pkl"
-GEMINI_MODELS = ["gemini-1.5-pro", "gemini-1.5-flash"]  # try pro first, fallback to flash
-CHUNK_SIZE = 500      # characters if using langchain; we also accept sentence based fallback
+GEMINI_MODELS = ["gemini-1.5-pro", "gemini-1.5-flash"]
+CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
 
 # =========================
 # STREAMLIT INIT
 # =========================
-st.set_page_config(page_title="📊 Financial Report RAG Bot", page_icon="📉", layout="wide")
+st.set_page_config(
+    page_title="📊 Financial Report RAG Bot",
+    page_icon="📉",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 os.makedirs("financial_index", exist_ok=True)
 
 # =========================
-# HELPERS: persistence
+# HELPERS
 # =========================
-def save_object(obj: Any, path: str) -> None:
+def clean_text(text: str) -> str:
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+def highlight_numbers(text: str) -> str:
+    if not text:
+        return text
+    text = re.sub(r'(\d+(\.\d+)?%)', r'**\1**', text)  # percentages
+    text = re.sub(r'(\$?\d[\d,\.]*)', r'**\1**', text)  # numbers and $ amounts
+    return text
+
+def get_file_hash(file_content: bytes) -> str:
+    return hashlib.md5(file_content).hexdigest()
+
+def save_object(obj: Any, path: str):
     with open(path, "wb") as f:
         pickle.dump(obj, f)
 
@@ -58,412 +64,265 @@ def load_object(path: str, default: Any):
     return default
 
 # =========================
-# CACHED RESOURCES
+# CACHE LOADERS
 # =========================
 @st.cache_resource
 def load_embedding_model():
-    model = SentenceTransformer(EMBEDDING_MODEL)
-    return model
+    return SentenceTransformer(EMBEDDING_MODEL)
 
 @st.cache_resource
-def load_or_create_faiss_index(dim: int):
+def load_faiss_index():
     if os.path.exists(INDEX_PATH):
-        try:
-            idx = faiss.read_index(INDEX_PATH)
-            # If dimension mismatch, create new
-            if idx.d != dim:
-                return faiss.IndexFlatL2(dim)
-            return idx
-        except Exception:
-            return faiss.IndexFlatL2(dim)
+        return faiss.read_index(INDEX_PATH)
     else:
-        return faiss.IndexFlatL2(dim)
+        return faiss.IndexFlatL2(384)
 
-def load_metadata() -> List[Dict[str, Any]]:
+@st.cache_resource
+def initialize_gemini_clients():
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    return {
+        model_name: genai.GenerativeModel(model_name)
+        for model_name in GEMINI_MODELS
+    }
+
+@st.cache_data
+def load_metadata_cached():
     return load_object(METADATA_PATH, [])
 
-def load_embedding_cache() -> Dict[str, Any]:
+@st.cache_data
+def load_embedding_cache_cached():
     return load_object(EMBEDDING_CACHE_PATH, {})
 
 # =========================
-# Initialize model, index, caches
+# RAG BOT
 # =========================
-model = load_embedding_model()
-EMBEDDING_DIM = model.get_sentence_embedding_dimension()
-index = load_or_create_faiss_index(EMBEDDING_DIM)
-metadata: List[Dict[str, Any]] = load_metadata()
-embedding_cache: Dict[str, Any] = load_embedding_cache()
+class FinancialRAGBot:
+    def __init__(self, model, index, metadata, embedding_cache, gemini_clients):
+        self.model = model
+        self.index = index
+        self.metadata = metadata
+        self.embedding_cache = embedding_cache
+        self.gemini_clients = gemini_clients
 
-# =========================
-# Configure Gemini (Google)
-# Put your GEMINI_API_KEY in Streamlit secrets under key 'GEMINI_API_KEY'
-# =========================
-try:
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    gemini_clients = {name: genai.GenerativeModel(name) for name in GEMINI_MODELS}
-except Exception as e:
-    gemini_clients = {}
-    st.warning("Warning: Gemini API not configured or failed to initialize. Put GEMINI_API_KEY in Streamlit secrets.")
+    def _get_cached_embeddings(self, chunks: tuple, _file_hash: str) -> np.ndarray:
+        if _file_hash in self.embedding_cache:
+            return np.array(self.embedding_cache[_file_hash])
+        
+        vectors = self.model.encode(list(chunks))
+        self.embedding_cache[_file_hash] = vectors.tolist()
+        save_object(self.embedding_cache, EMBEDDING_CACHE_PATH)
+        return vectors
 
-# =========================
-# Text cleaning & formatting
-# =========================
-def clean_text_for_chunks(text: str) -> str:
-    text = re.sub(r"\s+", " ", text)
-    text = text.strip()
-    return text
+    def process_pdf(self, file_content: bytes, company: str = "unknown"):
+        file_hash = get_file_hash(file_content)
+        if any(m.get("file_hash") == file_hash for m in self.metadata):
+            return {"success": False, "error": "File already processed"}
 
-def split_text_into_chunks(text: str, chunk_chars: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
-    """
-    Prefer langchain RecursiveCharacterTextSplitter if available for robust chunking;
-    otherwise fallback to sentence-based splitter that groups sentences into approx. chunk_chars.
-    """
-    text = clean_text_for_chunks(text)
-    if _HAS_LANGCHAIN:
-        splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_chars, chunk_overlap=overlap, separators=["\n\n", "\n", " ", ""])
-        return splitter.split_text(text)
-    # fallback: naive sentence splitter grouped to approximate char length
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    chunks = []
-    current = ""
-    for s in sentences:
-        if len(current) + len(s) + 1 <= chunk_chars:
-            current = (current + " " + s).strip()
-        else:
-            if len(current) > 30:
-                chunks.append(current)
-            current = s
-    if current and len(current) > 30:
-        chunks.append(current)
-    return chunks
-
-def highlight_numbers(text: str) -> str:
-    """Auto-bold numbers, dollar amounts, percentages, and simple decimals (EPS) for Markdown."""
-    if not text:
-        return text
-    # Bold percentages (e.g., 5% or 5.0%)
-    text = re.sub(r'(\d+(?:\.\d+)?)\s?%', r'**\1%**', text)
-    # Bold dollar amounts like $12,345.67
-    text = re.sub(r'\$\s*([\d,]+(?:\.\d+)?)', r'**$\1**', text)
-    # Bold plain numbers with commas/decimals (avoid making every small year bold accidentally is acceptable here)
-    text = re.sub(r'(?<!\$\*)\b(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+\.\d+)\b', r'**\1**', text)
-    # Avoid wrapping Markdown syntax accidentally: collapse multiple bold markers
-    text = re.sub(r'\*\*\s+\*\*', '**', text)
-    # Collapse excessive spaces
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
-
-def clean_and_normalize_answer(text: str) -> str:
-    """General fixes: ensure bullets, fix broken decimals like '12. 5' -> '12.5', ensure spaces around bullets."""
-    if not text:
-        return text
-    # Ensure each '*' bullet starts on a newline
-    text = re.sub(r'(?<!\n)\s*\*\s*', r'\n* ', text)
-    # Fix broken decimal splits: '12. 5' -> '12.5'
-    text = re.sub(r'(\d+)\.\s+(\d+)', r'\1.\2', text)
-    # Remove spaces before punctuation
-    text = re.sub(r'\s+([.,;:?!)])', r'\1', text)
-    text = re.sub(r'([(!])\s+', r'\1', text)
-    # Collapse many spaces
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
-
-# =========================
-# Embeddings, PDF processing & index updates
-# =========================
-def file_hash(content_bytes: bytes) -> str:
-    return hashlib.md5(content_bytes).hexdigest()
-
-def get_or_compute_embeddings(chunks: List[str], file_hash_key: str) -> np.ndarray:
-    """Return cached embeddings for file hash or compute and store them."""
-    global embedding_cache
-    if file_hash_key in embedding_cache:
-        arr = np.array(embedding_cache[file_hash_key], dtype="float32")
-        return arr
-    # compute
-    vectors = model.encode(chunks, convert_to_numpy=True)
-    embedding_cache[file_hash_key] = vectors.tolist()
-    try:
-        save_object(embedding_cache, EMBEDDING_CACHE_PATH)
-    except Exception:
-        pass
-    return vectors
-
-def process_pdf_bytes(content: bytes, company: str = "unknown") -> Dict[str, Any]:
-    """Extract text from PDF, chunk, embed and add to FAISS + metadata."""
-    global index, metadata
-    fh = file_hash(content)
-    # avoid duplicate file ingestion
-    if any(m.get("file_hash") == fh for m in metadata):
-        return {"success": False, "error": "File already ingested (duplicate)."}
-
-    try:
-        raw_text = extract_text(BytesIO(content))
-    except Exception as e:
-        return {"success": False, "error": f"PDF extraction failed: {e}"}
-    if not raw_text or len(raw_text.strip()) < 100:
-        return {"success": False, "error": "No text extracted or file too short."}
-
-    clean_text = clean_text_for_chunks(raw_text)
-    chunks = split_text_into_chunks(clean_text, chunk_chars=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
-    if not chunks:
-        return {"success": False, "error": "No chunks produced."}
-
-    vectors = get_or_compute_embeddings(chunks, fh)
-    # Add vectors and metadata in same order
-    for i, chunk in enumerate(chunks):
-        vec = np.array([vectors[i]]).astype("float32")
-        index.add(vec)
-        metadata.append({
-            "id": len(metadata),
-            "content": chunk,
-            "company": company,
-            "file_hash": fh,
-            "timestamp": datetime.now().isoformat()
-        })
-    # persist
-    try:
-        faiss.write_index(index, INDEX_PATH)
-    except Exception:
-        pass
-    try:
-        save_object(metadata, METADATA_PATH)
-    except Exception:
-        pass
-
-    return {"success": True, "chunks_added": len(chunks)}
-
-# =========================
-# Retrieval
-# =========================
-def retrieve(query: str, top_k: int = 5, companies: Optional[List[str]] = None, min_score: float = 0.0) -> List[Dict[str, Any]]:
-    """
-    Search FAISS for query nearest neighbors, then filter by companies if supplied.
-    Returns up to top_k metadata entries with similarity score (1/(1+dist)).
-    """
-    if index.ntotal == 0:
-        return []
-
-    q_vec = model.encode([query]).astype("float32")
-    # search more to allow company filtering
-    search_k = min(max(top_k * 3, top_k), index.ntotal)
-    D, I = index.search(q_vec, search_k)  # D: distances, I: indices
-
-    results = []
-    for dist, idx in zip(D[0], I[0]):
-        if idx < 0 or idx >= len(metadata):
-            continue
-        meta = metadata[idx]
-        if companies and len(companies) > 0 and meta.get("company") not in companies:
-            continue
-        similarity = 1.0 / (1.0 + float(dist))
-        if similarity < min_score:
-            continue
-        mcopy = meta.copy()
-        mcopy["score"] = similarity
-        results.append(mcopy)
-        if len(results) >= top_k:
-            break
-    return results
-
-# =========================
-# Gemini call (fallback)
-# =========================
-def generate_with_gemini(prompt: str, max_tokens: int = 500) -> Tuple[str, str]:
-    """Try models in GEMINI_MODELS order, return (text, model_name)."""
-    if not gemini_clients:
-        return "❌ Gemini not configured.", "none"
-    last_err = None
-    for name in GEMINI_MODELS:
-        client = gemini_clients.get(name)
-        if client is None:
-            continue
         try:
-            response = client.generate_content(prompt, generation_config={"max_output_tokens": max_tokens, "temperature": 0.3})
-            # response.text is used by SDK
-            text = getattr(response, "text", None)
-            if text is None:
-                # some SDKs return different shapes; try to str(response) fallback
-                text = str(response)
-            return text, name
+            text = extract_text(BytesIO(file_content))
+            if not text or len(text.strip()) < 100:
+                return {"success": False, "error": "No text extracted or text too short"}
         except Exception as e:
-            last_err = e
-            # if quota, try next; else break and return error
-            if "429" in str(e) or "quota" in str(e).lower():
-                continue
-            return f"❌ Gemini error: {e}", name
-    return f"❌ All Gemini models failed. Last error: {last_err}", "none"
+            return {"success": False, "error": f"Error extracting text: {str(e)}"}
+
+        text = clean_text(text)
+        
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            separators=["\n\n", "\n", " ", ""]
+        )
+        chunks = text_splitter.split_text(text)
+        
+        vectors = self._get_cached_embeddings(tuple(chunks), file_hash)
+        
+        for i, chunk in enumerate(chunks):
+            self.index.add(np.array([vectors[i]]).astype("float32"))
+            self.metadata.append({
+                "id": len(self.metadata),
+                "content": chunk,
+                "company": company,
+                "file_hash": file_hash,
+                "timestamp": datetime.now().isoformat(),
+            })
+
+        faiss.write_index(self.index, INDEX_PATH)
+        save_object(self.metadata, METADATA_PATH)
+        return {"success": True, "chunks": len(chunks)}
+
+    def retrieve(self, query: str, top_k: int = 5, companies: List[str] = None) -> List[Dict[str, Any]]:
+        if self.index.ntotal == 0:
+            return []
+        
+        q_vec = self.model.encode([query])
+        
+        filtered_indices = []
+        if companies:
+            all_companies = [m['company'] for m in self.metadata]
+            for i, c in enumerate(all_companies):
+                if c in companies:
+                    filtered_indices.append(i)
+        else:
+            filtered_indices = list(range(len(self.metadata)))
+
+        if not filtered_indices:
+            return []
+        
+        filtered_vectors = np.array([self.model.encode([self.metadata[i]['content']])[0] for i in filtered_indices])
+        temp_index = faiss.IndexFlatL2(384)
+        temp_index.add(filtered_vectors.astype("float32"))
+        
+        D, I = temp_index.search(np.array(q_vec).astype("float32"), min(top_k, temp_index.ntotal))
+
+        retrieved_chunks = []
+        for i in I[0]:
+            original_index = filtered_indices[i]
+            retrieved_chunks.append(self.metadata[original_index])
+            
+        return retrieved_chunks
+
+    def generate_with_gemini(self, prompt: str, max_tokens: int = 500):
+        for model_name in GEMINI_MODELS:
+            try:
+                client = self.gemini_clients[model_name]
+                response = client.generate_content(
+                    prompt,
+                    generation_config={
+                        "max_output_tokens": max_tokens,
+                        "temperature": 0.3,
+                    }
+                )
+                return response.text, model_name
+            except Exception as e:
+                if "429" in str(e) or "quota" in str(e).lower():
+                    continue
+                return f"❌ Gemini error: {str(e)}", model_name
+        return "❌ All Gemini models failed.", "none"
 
 # =========================
-# Export helpers
+# INIT BOT
 # =========================
-def build_history_df(history: List[Dict[str, Any]]) -> pd.DataFrame:
-    rows = []
-    for rec in history:
-        q = rec.get("question")
-        a = rec.get("answer")
-        sources = ", ".join(sorted({c.get("company", "Unknown") for c in rec.get("chunks", [])}))
-        ts = rec.get("timestamp")
-        rows.append({"Question": q, "Answer": a, "Sources": sources, "Timestamp": ts})
-    return pd.DataFrame(rows)
+@st.cache_resource
+def get_bot():
+    model = load_embedding_model()
+    index = load_faiss_index()
+    metadata = load_metadata_cached()
+    embedding_cache = load_embedding_cache_cached()
+    gemini_clients = initialize_gemini_clients()
+    return FinancialRAGBot(model, index, metadata, embedding_cache, gemini_clients)
 
-def get_download_bytes_for_df(df: pd.DataFrame, fmt: str = "csv") -> bytes:
-    if fmt == "csv":
-        return df.to_csv(index=False).encode("utf-8")
-    elif fmt == "excel":
-        buffer = BytesIO()
-        with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-            df.to_excel(writer, index=False, sheet_name="QnA")
-        return buffer.getvalue()
-    else:
-        raise ValueError("Unsupported format")
+bot = get_bot()
 
-# =========================
-# Session state init
-# =========================
 if "history" not in st.session_state:
-    st.session_state.history: List[Dict[str, Any]] = []
+    st.session_state.history = []
 
 # =========================
-# Sidebar: uploads, controls, export
+# SIDEBAR
 # =========================
 st.sidebar.title("⚙️ Document Management")
-uploaded_files = st.sidebar.file_uploader("Upload PDF(s)", type="pdf", accept_multiple_files=True)
+uploaded = st.sidebar.file_uploader("📂 Upload Financial PDF", type="pdf")
+company_tag = st.sidebar.text_input("🏷️ Company Name", help="Provide a tag for this report, e.g., 'Tesla 2023 Q4'")
 
-company_tag = st.sidebar.text_input("Company tag (optional)", placeholder="e.g., Coca-Cola Q2 2025")
+if uploaded:
+    with st.spinner("🔄 Processing PDF..."):
+        result = bot.process_pdf(uploaded.read(), company=company_tag or uploaded.name)
+        if result["success"]:
+            st.sidebar.success(f"✅ Added {result['chunks']} chunks from '{uploaded.name}'")
+            st.rerun()
+        else:
+            st.sidebar.error(f"❌ {result['error']}")
 
-if uploaded_files:
-    for f in uploaded_files:
-        content = f.read()
-        with st.spinner(f"Processing {f.name}..."):
-            res = process_pdf_bytes(content, company=company_tag or f.name)
-            if res.get("success"):
-                st.sidebar.success(f"Added {res.get('chunks_added')} chunks from {f.name}")
-            else:
-                st.sidebar.error(f"Failed to process {f.name}: {res.get('error')}")
-    # After processing, re-persist index & metadata already done inside function, refresh ui
-    st.experimental_rerun()
-
-if st.sidebar.button("Reset Index & Data"):
-    # remove files, reset in-memory
-    for p in (INDEX_PATH, METADATA_PATH, EMBEDDING_CACHE_PATH):
-        try:
-            if os.path.exists(p):
-                os.remove(p)
-        except Exception:
-            pass
-    # recreate empty index and metadata
-    index.reset()
-    metadata.clear()
-    embedding_cache.clear()
+if st.sidebar.button("🧹 Reset Index"):
+    if os.path.exists(INDEX_PATH): os.remove(INDEX_PATH)
+    if os.path.exists(METADATA_PATH): os.remove(METADATA_PATH)
+    if os.path.exists(EMBEDDING_CACHE_PATH): os.remove(EMBEDDING_CACHE_PATH)
+    st.cache_resource.clear()
+    st.cache_data.clear()
     st.session_state.history.clear()
-    st.sidebar.success("Index, metadata and cache cleared.")
-    st.experimental_rerun()
+    st.rerun()
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Processed documents")
-if metadata:
-    counts: Dict[str, int] = {}
-    for m in metadata:
-        counts[m.get("company", "unknown")] = counts.get(m.get("company", "unknown"), 0) + 1
-    st.sidebar.json(counts)
+st.sidebar.subheader("Processed Documents")
+if bot.metadata:
+    df_metadata = {
+        "File Name/Company": sorted(list(set([m['company'] for m in bot.metadata]))),
+    }
+    st.sidebar.json(df_metadata, expanded=False)
 else:
     st.sidebar.info("No documents processed yet.")
 
-# export buttons (history)
-st.sidebar.markdown("---")
-st.sidebar.subheader("Export Q&A History")
-if st.session_state.history:
-    df_hist = build_history_df(st.session_state.history)
-    csv_bytes = get_download_bytes_for_df(df_hist, "csv")
-    excel_bytes = get_download_bytes_for_df(df_hist, "excel")
-    st.sidebar.download_button("Download CSV", csv_bytes, file_name=f"qa_history_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", mime="text/csv")
-    st.sidebar.download_button("Download Excel", excel_bytes, file_name=f"qa_history_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-else:
-    st.sidebar.info("No Q&A history to export")
-
 # =========================
-# Main UI
+# MAIN UI
 # =========================
 st.title("📊 Financial Report RAG Bot")
-st.markdown(
-    "Upload financial PDFs, then ask a question. Answers are retrieved using FAISS + Sentence Transformers and generated with Gemini (with fallback)."
+st.markdown("Upload financial PDFs and ask questions. Gemini will summarize with context and source citation.")
+
+all_companies = sorted(list(set(m['company'] for m in bot.metadata)))
+selected_companies = st.multiselect(
+    "Filter by Company (optional):",
+    options=all_companies,
+    default=all_companies,
+    placeholder="Select companies to search..."
 )
 
-# company filter
-all_companies = sorted(list({m.get("company", "unknown") for m in metadata}))
-selected_companies = st.multiselect("Filter by company (optional)", options=all_companies, default=all_companies if all_companies else [])
-
-query = st.text_input("💬 Ask your financial question:", placeholder="e.g. What was the revenue growth in Q4?")
-
-col1, col2 = st.columns(2)
-with col1:
-    top_k = st.slider("Context chunks to retrieve", 1, 10, 5)
-with col2:
-    min_sim = st.slider("Minimum similarity (0-1)", 0.0, 1.0, 0.0, 0.05)
+query = st.text_input("💬 Ask your financial question:", key="user_query")
 
 if st.button("Get Answer"):
-    if not query or not query.strip():
-        st.warning("Please type a question.")
-    elif index.ntotal == 0:
-        st.warning("Please upload and process at least one PDF first.")
+    if not query:
+        st.warning("Please enter a question.")
+    elif not bot.metadata:
+        st.warning("Please upload and process at least one document first.")
     else:
-        with st.spinner("Retrieving context and generating answer..."):
-            retrieved = retrieve(query, top_k=top_k, companies=selected_companies, min_score=min_sim)
-            if not retrieved:
-                st.info("No relevant information found in the uploaded documents.")
-                st.session_state.history.append({"question": query, "answer": "No relevant information found.", "chunks": [], "timestamp": datetime.now().isoformat(), "model": "none"})
+        with st.spinner("Thinking..."):
+            chunks = bot.retrieve(query, top_k=5, companies=selected_companies)
+            
+            if not chunks:
+                answer = "I couldn't find any relevant information in the uploaded documents."
+                st.session_state.history.append((query, answer, []))
             else:
-                # Build context with short previews
-                context_parts = []
-                for r in retrieved:
-                    preview = r.get("content", "")[:600].strip()
-                    context_parts.append(f"--- Source: {r.get('company','unknown')} (score {r.get('score',0):.3f}) ---\n{preview}")
-                context_text = "\n\n".join(context_parts)
+                context_with_sources = "\n\n".join([
+                    f"--- Source: {chunk['company']} ---\n{chunk['content']}"
+                    for chunk in chunks
+                ])
 
-                prompt = f"""You are a professional financial analyst assistant. Use the provided context to answer the question clearly and concisely.
-Highlight numeric metrics. Cite sources in parentheses like (Source: Company Name).
+                prompt = f"""
+You are a financial assistant. Use the provided context to answer the question.
+Your answer should be direct and concise.
+Highlight all **numbers** and **percentages**.
+Cite the source from the context, e.g., (Source: Company XYZ).
 
 CONTEXT:
-{context_text}
+{context_with_sources}
 
 QUESTION: {query}
 
-ANSWER:"""
+ANSWER:
+"""
+                answer, model_used = bot.generate_with_gemini(prompt)
+                answer = highlight_numbers(answer)
 
-                raw_answer, model_used = generate_with_gemini(prompt, max_tokens=600)
-                if not raw_answer:
-                    raw_answer = "⚠️ Empty response from Gemini."
+                st.session_state.history.append((query, answer, chunks))
 
-                cleaned = clean_and_normalize_answer(raw_answer)
-                highlighted = highlight_numbers(cleaned)
-
-                # show the answer
-                st.markdown("### 📋 Answer")
-                st.markdown(highlighted)
-
-                # Save to history with chunks for traceability
-                st.session_state.history.append({
-                    "question": query,
-                    "answer": highlighted,
-                    "chunks": retrieved,
-                    "timestamp": datetime.now().isoformat(),
-                    "model": model_used
-                })
-
-# Show chat / history
+# =========================
+# CHAT HISTORY
+# =========================
 st.markdown("---")
 st.markdown("## 🗣️ Chat History")
+
 if st.session_state.history:
-    # show newest first
-    for rec in reversed(st.session_state.history):
-        st.markdown(f"**You:** {rec.get('question')}")
-        st.markdown(f"**Bot:** {rec.get('answer')}")
-        if rec.get("chunks"):
-            with st.expander("📚 Sources used (preview)"):
-                for c in rec.get("chunks"):
-                    st.markdown(f"- **{c.get('company','unknown')}** (score {c.get('score',0):.3f}) → {c.get('content','')[:240]}...")
-        st.caption(f"Model: {rec.get('model','unknown')}  •  {rec.get('timestamp')}")
+    for q, a, retrieved_chunks in reversed(st.session_state.history):
+        st.markdown(f"**You:** {q}")
+        st.markdown(f"**Bot:** {a}")
+        
+        if retrieved_chunks:
+            with st.expander("📚 Show Sources"):
+                sources_str = ""
+                sources_seen = set()
+                for chunk in retrieved_chunks:
+                    source_key = (chunk['company'], chunk['file_hash'])
+                    if source_key not in sources_seen:
+                        sources_str += f"- **Company:** {chunk['company']}\n"
+                        sources_seen.add(source_key)
+                st.markdown(sources_str)
+        
         st.markdown("---")
-else:
-    st.info("No Q&A yet. Ask a question to get started.")
