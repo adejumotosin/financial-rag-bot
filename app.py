@@ -9,7 +9,7 @@ from sentence_transformers import SentenceTransformer
 import re
 from typing import List, Dict, Any
 import logging
-from google import genai
+import google.generativeai as genai
 
 # ==== CONFIG ====
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
