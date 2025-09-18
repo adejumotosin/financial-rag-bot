@@ -1,18 +1,18 @@
-import streamlit as st 
-import numpy as np 
-import faiss 
-import pickle 
-import os from io 
-import BytesIO 
+import streamlit as st
+import numpy as np
+import faiss
+import pickle
+import os
+from io import BytesIO
 from pdfminer.high_level import extract_text
-from sentence_transformers import SentenceTransformer 
-import google.generativeai as genai 
-import re 
-from datetime import datetime 
-import hashlib 
-import json 
-import base64 
-from typing import Tuple
+from sentence_transformers import SentenceTransformer
+import google.generativeai as genai
+import re
+from datetime import datetime
+import hashlib
+import json
+import base64
+from typing import Dict, List, Tuple, Optional
 
 ==== CONFIG ====
 
