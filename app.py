@@ -1,201 +1,224 @@
-import streamlit as st
-import numpy as np
-import faiss
-import pickle
-import os
-import pandas as pd
-from io import BytesIO
-from pdfminer.high_level import extract_text
-from sentence_transformers import SentenceTransformer
-import google.generativeai as genai
-import re
-import json
-from datetime import datetime
-import hashlib
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from typing import List, Dict, Any
+import streamlit as st import numpy as np import faiss import pickle import os import pandas as pd from io import BytesIO from pdfminer.high_level import extract_text from sentence_transformers import SentenceTransformer import google.generativeai as genai import re import json from datetime import datetime import hashlib from langchain.text_splitter import RecursiveCharacterTextSplitter from typing import List, Dict, Any
 
-# =========================
-# CONFIG
-# =========================
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-INDEX_PATH = "financial_index/faiss_index.bin"
-METADATA_PATH = "financial_index/metadata.pkl"
-EMBEDDING_CACHE_PATH = "financial_index/embedding_cache.pkl"
-GEMINI_MODELS = ["gemini-1.5-pro", "gemini-1.5-flash"]
-CHUNK_SIZE = 1000
-OVERLAP = 200
+=========================
 
-# =========================
-# FINANCIAL REPORT BOT
-# =========================
-class FinancialRAGBot:
-    def __init__(self, api_key: str):
-        genai.configure(api_key=api_key)
-        self.model = SentenceTransformer(EMBEDDING_MODEL)
-        self.metadata = []
-        self.embedding_cache = {}
-        self.index = None
+CONFIG
 
-        # Create the directory if it doesn't exist
-        os.makedirs("financial_index", exist_ok=True)
+=========================
 
-        if os.path.exists(METADATA_PATH):
-            with open(METADATA_PATH, "rb") as f:
-                self.metadata = pickle.load(f)
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2" INDEX_PATH = "financial_index/faiss_index.bin" METADATA_PATH = "financial_index/metadata.pkl" EMBEDDING_CACHE_PATH = "financial_index/embedding_cache.pkl"
 
-        if os.path.exists(EMBEDDING_CACHE_PATH):
-            with open(EMBEDDING_CACHE_PATH, "rb") as f:
-                self.embedding_cache = pickle.load(f)
+LLM_MODELS = [ "claude-3-opus-20240229",   # Anthropic Claude 3 Opus "gemini-1.5-pro-latest",    # Google Gemini Pro ] CHUNK_SIZE = 1000 OVERLAP = 200
 
-        if os.path.exists(INDEX_PATH):
-            self.index = faiss.read_index(INDEX_PATH)
+=========================
 
-    def embed_text(self, text: str):
-        if text in self.embedding_cache:
-            return self.embedding_cache[text]
-        emb = self.model.encode([text])[0].astype("float32")
-        self.embedding_cache[text] = emb
-        return emb
+FINANCIAL RAG BOT CLASS
 
-    def save(self):
-        if self.index:
-            faiss.write_index(self.index, INDEX_PATH)
-        with open(METADATA_PATH, "wb") as f:
-            pickle.dump(self.metadata, f)
-        with open(EMBEDDING_CACHE_PATH, "wb") as f:
-            pickle.dump(self.embedding_cache, f)
+=========================
 
-    def add_document(self, file, company: str):
-        text = extract_text(file)
-        splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=OVERLAP)
-        chunks = splitter.split_text(text)
+class FinancialRAGBot: def init(self, api_keys: Dict[str, str]): if api_keys.get("google"): genai.configure(api_key=api_keys["google"])
 
-        vectors = []
-        new_metadata = []
+self.anthropic_client = None
+    if api_keys.get("anthropic"):
+        import anthropic
+        self.anthropic_client = anthropic.Anthropic(api_key=api_keys["anthropic"])
 
-        for chunk in chunks:
-            emb = self.embed_text(chunk)
-            vectors.append(emb)
-            new_metadata.append({
-                "company": company,
-                "content": chunk,
-                "source": file.name,
-                "hash": hashlib.md5(chunk.encode()).hexdigest()
-            })
+    self.model = SentenceTransformer(EMBEDDING_MODEL)
+    self.metadata = []
+    self.embedding_cache = {}
+    self.index = None
 
-        vectors = np.vstack(vectors)
+    os.makedirs("financial_index", exist_ok=True)
 
-        if self.index is None:
-            self.index = faiss.IndexFlatL2(vectors.shape[1])
-        self.index.add(vectors)
-        self.metadata.extend(new_metadata)
-        self.save()
+    if os.path.exists(METADATA_PATH):
+        with open(METADATA_PATH, "rb") as f:
+            self.metadata = pickle.load(f)
+    if os.path.exists(EMBEDDING_CACHE_PATH):
+        with open(EMBEDDING_CACHE_PATH, "rb") as f:
+            self.embedding_cache = pickle.load(f)
+    if os.path.exists(INDEX_PATH):
+        self.index = faiss.read_index(INDEX_PATH)
 
-    def generate_with_gemini(self, prompt: str, max_tokens=500):
-        """Try Gemini models in fallback order."""
-        for model_name in GEMINI_MODELS:
-            try:
+def generate_with_llm(self, prompt: str, max_tokens=2000):
+    """Try LLMs in fallback order (Claude → Gemini)."""
+    for model_name in LLM_MODELS:
+        try:
+            if model_name.startswith("claude-") and self.anthropic_client:
+                response = self.anthropic_client.messages.create(
+                    model=model_name,
+                    max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                return response.content[0].text, model_name
+
+            elif model_name.startswith("gemini-") and genai.is_configured():
                 model = genai.GenerativeModel(model_name)
                 response = model.generate_content(prompt, generation_config={"max_output_tokens": max_tokens})
                 if response and response.candidates:
                     text = getattr(response, "text", None) or response.candidates[0].content.parts[0].text
                     return text, model_name
-            except Exception:
-                continue
-        return "", None
 
-    def extract_financials(self, company: str):
-        """Extract financial metrics into CSV-ready DataFrame."""
-        # Retrieve all content for the specified company at once
-        full_text = " ".join([m["content"] for m in self.metadata if m["company"] == company])
-        
-        if not full_text:
-            return pd.DataFrame()
+        except Exception as e:
+            st.warning(f"⚠️ Error with {model_name}: {e}")
+            continue
 
-        prompt = f"""
-You are an expert financial analyst. Your task is to extract key financial metrics from the provided text of a financial report.
-Read the entire document carefully to find the most accurate and recent data.
-Return ONLY a single valid JSON object. Do not include any explanations, markdown, or commentary.
+    return "", None
 
-Expected JSON schema:
-{{
-  "Company": "{company}",
-  "Quarter": "Q[X] YYYY",
-  "Revenue": number,
-  "OperatingIncome": number,
-  "OperatingMargin": number,
-  "NetIncome": number,
-  "EPS": number,
-  "ComparableEPS": number
-}}
+def add_document(self, file, company: str):
+    text = extract_text(file)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=OVERLAP)
+    chunks = splitter.split_text(text)
 
-Instructions for extraction:
-1.  Locate the values for the most recent quarter in the document.
-2.  Be careful with the units. The values should be in a consistent numerical format (e.g., 12500000000 instead of 12.5 billion).
-3.  If a specific value is not found, use `null` for that field. Do not make up a value.
-4.  Ensure the extracted data corresponds to the company "{company}" and its most recent quarter results.
+    if self.index is None:
+        self.index = faiss.IndexFlatL2(self.model.get_sentence_embedding_dimension())
 
-TEXT:
-{full_text}
-"""
+    for chunk in chunks:
+        h = hashlib.sha256(chunk.encode()).hexdigest()
+        if h not in self.embedding_cache:
+            embedding = self.model.encode([chunk])[0]
+            self.embedding_cache[h] = embedding
+            self.index.add(np.array([embedding], dtype="float32"))
+            self.metadata.append({"company": company, "content": chunk, "hash": h})
 
-        text, model_used = self.generate_with_gemini(prompt, max_tokens=1000)
-        
-        try:
-            cleaned_text = re.sub(r"```json|```", "", text).strip()
-            parsed_data = json.loads(cleaned_text)
-            
-            # Post-processing and validation
-            if isinstance(parsed_data, dict):
-                # Convert single dictionary to a list of one for DataFrame compatibility
-                parsed_data = [parsed_data]
-                
-                # Simple validation: ensure company name is correct and key metrics are not null
-                df = pd.DataFrame(parsed_data)
-                df = df[df['Company'] == company].dropna(subset=['Revenue', 'NetIncome'])
-                
-                if not df.empty:
-                    return df
-                    
-        except (json.JSONDecodeError, KeyError) as e:
-            st.warning(f"⚠️ Failed to parse JSON or validate data: {e}")
-            st.text_area("🐞 Debug: Raw Gemini Output", text, height=300)
+    self.save()
 
-        st.warning("⚠️ No valid structured data could be extracted.")
+def save(self):
+    faiss.write_index(self.index, INDEX_PATH)
+    with open(METADATA_PATH, "wb") as f:
+        pickle.dump(self.metadata, f)
+    with open(EMBEDDING_CACHE_PATH, "wb") as f:
+        pickle.dump(self.embedding_cache, f)
+
+def extract_financials(self, company: str):
+    full_text = " ".join([m["content"] for m in self.metadata if m["company"] == company])
+    if not full_text:
         return pd.DataFrame()
 
-# =========================
-# STREAMLIT UI
-# =========================
+    prompt = f"""
+
+You are an expert financial analyst. Extract key financial metrics from the following financial report text.
+
+Return ONLY a valid JSON object (no markdown, no commentary).
+
+Schema: {{ "Company": "string", "Quarter": "string (e.g., Q1 2024, FY 2024)", "Revenue": number (in millions USD), "OperatingIncome": number (in millions USD), "OperatingMargin": number (percentage, e.g., 34.1), "NetIncome": number (in millions USD), "EPS": number, "ComparableEPS": number }}
+
+Rules:
+
+1. Focus ONLY on the most recent quarter or fiscal year.
+
+
+2. Use the company "{company}" only.
+
+
+3. Normalize all amounts to millions USD.
+
+"$12.5 billion" → 12500
+
+"$12,500 million" → 12500
+
+
+
+4. If a metric is missing, use null.
+
+
+5. Pick the most explicit & final figure (tables > narrative).
+
+
+6. Do not output explanations.
+
+
+
+TEXT: {full_text} """
+
+text, model_used = self.generate_with_llm(prompt, max_tokens=2000)
+    if not text:
+        st.warning("⚠️ No text returned by LLM.")
+        return pd.DataFrame()
+
+    try:
+        cleaned = re.sub(r"```json|```", "", text).strip()
+        parsed = json.loads(cleaned)
+        if not isinstance(parsed, dict):
+            st.warning("⚠️ Unexpected JSON format.")
+            return pd.DataFrame()
+
+        data = parsed
+        errors = []
+
+        if data.get("Company") != company:
+            errors.append("Company mismatch. Forcing correction.")
+            data["Company"] = company
+
+        required = ["Revenue", "NetIncome", "Quarter"]
+        for r in required:
+            if data.get(r) is None:
+                errors.append(f"Missing required: {r}")
+
+        for key in ["Revenue", "OperatingIncome", "OperatingMargin", "NetIncome", "EPS", "ComparableEPS"]:
+            val = data.get(key)
+            if val is not None:
+                try:
+                    data[key] = float(val)
+                except:
+                    errors.append(f"{key} invalid number: {val}")
+                    data[key] = None
+
+        if errors:
+            st.warning("⚠️ Validation issues found:")
+            for e in errors:
+                st.write("- " + e)
+            st.text_area("🐞 Debug Output", cleaned, height=300)
+
+        return pd.DataFrame([data])
+
+    except Exception as e:
+        st.warning(f"⚠️ Failed to parse JSON: {e}")
+        st.text_area("🐞 Raw Output", text, height=300)
+        return pd.DataFrame()
+
+=========================
+
+STREAMLIT UI
+
+=========================
+
 st.set_page_config(page_title="📊 Financial Report RAG Bot", layout="wide")
 
-st.title("📊 Financial Report RAG Bot")
-st.caption("Upload financial PDFs and ask questions. Gemini will summarize with context and source citation.")
+st.title("📊 Financial Report RAG Bot") st.caption("Upload financial PDFs and extract structured data with Claude/Gemini.")
 
-api_key = st.sidebar.text_input("🔑 Enter Gemini API Key", type="password")
+st.sidebar.subheader("🔑 API Keys") google_api_key = st.sidebar.text_input("Google Gemini API Key", type="password") anthropic_api_key = st.sidebar.text_input("Anthropic Claude API Key", type="password")
 
-if api_key:
-    bot = FinancialRAGBot(api_key)
+api_keys = {} if google_api_key: api_keys["google"] = google_api_key if anthropic_api_key: api_keys["anthropic"] = anthropic_api_key
 
-    st.subheader("⚙️ Document Management")
-    uploaded = st.file_uploader("📂 Upload Financial PDF", type=["pdf"])
+if api_keys: bot = FinancialRAGBot(api_keys)
 
-    if uploaded:
-        company_name = st.text_input("🏷️ Company Name", value=uploaded.name.split(".")[0])
-        if st.button("Process Document"):
+st.subheader("⚙️ Document Management")
+uploaded = st.file_uploader("📂 Upload Financial PDF", type=["pdf"])
+
+if uploaded:
+    company_name = st.text_input("🏷️ Company Name", value=uploaded.name.split(".")[0])
+    if st.button("Process Document"):
+        if not bot.anthropic_client and not genai.is_configured():
+            st.error("Please provide at least one LLM API key.")
+        else:
             bot.add_document(uploaded, company_name)
             st.success(f"✅ Processed {uploaded.name} for {company_name}")
 
-    if bot.metadata:
-        st.subheader("📊 Financial Report RAG Bot")
-        company_for_extract = st.selectbox("Select company to extract financials:", sorted(set(m["company"] for m in bot.metadata)))
-        
-        if st.button("📤 Extract Financials to CSV"):
+if bot.metadata:
+    st.subheader("📊 Extract Financials")
+    company_for_extract = st.selectbox("Select company to extract:", sorted(set(m["company"] for m in bot.metadata)))
+
+    if st.button("📤 Extract Financials to CSV"):
+        if not bot.anthropic_client and not genai.is_configured():
+            st.error("Please configure an API key to extract financials.")
+        else:
             df = bot.extract_financials(company_for_extract)
             if not df.empty:
                 st.dataframe(df)
                 csv = df.to_csv(index=False).encode("utf-8")
                 st.download_button("📥 Download CSV", data=csv, file_name=f"{company_for_extract}_financials.csv", mime="text/csv")
             else:
-                st.error("❌ No financials could be extracted.")
+                st.error("❌ No valid financials could be extracted.")
+
+else: st.info("Please enter at least one LLM API key in the sidebar to begin.")
+
