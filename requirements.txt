@@ -1,9 +1,9 @@
 streamlit
 numpy
+pandas
 faiss-cpu
 sentence-transformers
-torch
 pdfminer.six
-requests
 google-generativeai
 langchain
+xlsxwriter
