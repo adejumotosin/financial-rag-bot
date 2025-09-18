@@ -67,32 +67,32 @@ class FinancialRAGBot:
             self.index = faiss.read_index(INDEX_PATH)
 
     def generate_with_llm(self, prompt: str, max_tokens=2000):
-        """Try LLMs in fallback order (Claude → Gemini)."""
-        for model_name in LLM_MODELS:
-            try:
-                if model_name.startswith("claude-") and self.anthropic_client:
-                    response = self.anthropic_client.messages.create(
-                        model=model_name,
-                        max_tokens=max_tokens,
-                        messages=[{"role": "user", "content": prompt}]
-                    )
-                    return response.content[0].text, model_name
+    """Try LLMs in fallback order (Claude → Gemini)."""
+    for model_name in LLM_MODELS:
+        try:
+            if model_name.startswith("claude-") and self.anthropic_client:
+                response = self.anthropic_client.messages.create(
+                    model=model_name,
+                    max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                return response.content[0].text, model_name
 
-                elif model_name.startswith("gemini-") and genai.is_configured():
-                    model = genai.GenerativeModel(model_name)
-                    response = model.generate_content(
-                        prompt,
-                        generation_config={"max_output_tokens": max_tokens}
-                    )
-                    if response and response.candidates:
-                        text = getattr(response, "text", None) or response.candidates[0].content.parts[0].text
-                        return text, model_name
+            elif model_name.startswith("gemini-") and getattr(genai, "api_key", None):
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(
+                    prompt,
+                    generation_config={"max_output_tokens": max_tokens}
+                )
+                if response and response.candidates:
+                    text = getattr(response, "text", None) or response.candidates[0].content.parts[0].text
+                    return text, model_name
 
-            except Exception as e:
-                st.warning(f"⚠️ Error with {model_name}: {e}")
-                continue
+        except Exception as e:
+            st.warning(f"⚠️ Error with {model_name}: {e}")
+            continue
 
-        return "", None
+    return "", None
 
     def add_document(self, file, company: str):
         text = extract_text(file)
