@@ -66,35 +66,38 @@ def load_object(path: str, default: Any):
     return default
 
 # =========================
+# CACHED RESOURCE LOADERS
+# =========================
+@st.cache_resource
+def load_embedding_model():
+    return SentenceTransformer(EMBEDDING_MODEL)
+
+@st.cache_resource
+def load_faiss_index():
+    if os.path.exists(INDEX_PATH):
+        return faiss.read_index(INDEX_PATH)
+    else:
+        return faiss.IndexFlatL2(384)
+
+@st.cache_resource
+def initialize_gemini_clients():
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    return {
+        model_name: genai.GenerativeModel(model_name)
+        for model_name in GEMINI_MODELS
+    }
+
+# =========================
 # CORE RAG BOT CLASS
 # =========================
 class FinancialRAGBot:
-    def __init__(self):
-        # Initialize components and load state
-        self.model = self._load_embedding_model()
-        self.metadata = load_object(METADATA_PATH, [])
-        self.embedding_cache = load_object(EMBEDDING_CACHE_PATH, {})
-        self.index = self._initialize_faiss_index()
-        self.gemini_clients = {
-            model_name: genai.GenerativeModel(model_name)
-            for model_name in GEMINI_MODELS
-        }
+    def __init__(self, model, index, metadata, embedding_cache, gemini_clients):
+        self.model = model
+        self.index = index
+        self.metadata = metadata
+        self.embedding_cache = embedding_cache
+        self.gemini_clients = gemini_clients
         
-    @st.cache_resource
-    def _load_embedding_model(self):
-        return SentenceTransformer(EMBEDDING_MODEL)
-
-    def _initialize_faiss_index(self):
-        if os.path.exists(INDEX_PATH):
-            index = faiss.read_index(INDEX_PATH)
-            # Add existing embeddings to index if it's empty but metadata exists
-            if index.ntotal == 0 and self.metadata:
-                all_vectors = np.array([v for v in self.embedding_cache.values()]).reshape(-1, 384)
-                index.add(all_vectors.astype("float32"))
-            return index
-        else:
-            return faiss.IndexFlatL2(384)
-
     def _get_cached_embeddings(self, chunks: tuple, _file_hash: str) -> np.ndarray:
         if _file_hash in self.embedding_cache:
             return np.array(self.embedding_cache[_file_hash])
@@ -118,7 +121,6 @@ class FinancialRAGBot:
 
         text = clean_text(text)
         
-        # Advanced Chunking with LangChain's RecursiveCharacterTextSplitter
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
@@ -128,6 +130,7 @@ class FinancialRAGBot:
         
         vectors = self._get_cached_embeddings(tuple(chunks), file_hash)
         
+        # Add to index and metadata
         for i, chunk in enumerate(chunks):
             self.index.add(np.array([vectors[i]]).astype("float32"))
             self.metadata.append({
@@ -148,7 +151,6 @@ class FinancialRAGBot:
         
         q_vec = self.model.encode([query])
         
-        # Filter metadata by company before searching
         filtered_indices = []
         if companies:
             all_companies = [m['company'] for m in self.metadata]
@@ -158,7 +160,6 @@ class FinancialRAGBot:
         else:
             filtered_indices = list(range(len(self.metadata)))
 
-        # Create a sub-index for the filtered data
         filtered_vectors = np.array([self.model.encode([self.metadata[i]['content']])[0] for i in filtered_indices])
         if not filtered_vectors.any():
             return []
@@ -196,11 +197,15 @@ class FinancialRAGBot:
 # =========================
 # STREAMLIT UI & LOGIC
 # =========================
-
-# Initialize the RAG Bot
 @st.cache_resource
 def get_bot():
-    return FinancialRAGBot()
+    """Initializes and returns the RAG bot, passing cached resources."""
+    model = load_embedding_model()
+    index = load_faiss_index()
+    metadata = load_object(METADATA_PATH, [])
+    embedding_cache = load_object(EMBEDDING_CACHE_PATH, {})
+    gemini_clients = initialize_gemini_clients()
+    return FinancialRAGBot(model, index, metadata, embedding_cache, gemini_clients)
 
 bot = get_bot()
 
@@ -220,6 +225,8 @@ if uploaded:
         result = bot.process_pdf(uploaded.read(), company=company_tag or uploaded.name)
         if result["success"]:
             st.sidebar.success(f"✅ Added {result['chunks']} chunks from '{uploaded.name}'")
+            # To refresh the list of companies, we need to rerun the app
+            st.rerun()
         else:
             st.sidebar.error(f"❌ {result['error']}")
 
@@ -235,7 +242,7 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("Processed Documents")
 if bot.metadata:
     df_metadata = {
-        "File Name/Company": list(set([m['company'] for m in bot.metadata])),
+        "File Name/Company": sorted(list(set([m['company'] for m in bot.metadata]))),
     }
     st.sidebar.json(df_metadata, expanded=False)
 else:
@@ -247,7 +254,6 @@ else:
 st.title("📊 Financial Report RAG Bot")
 st.markdown("Upload financial PDFs and ask questions. Gemini will summarize with context and source citation.")
 
-# Allow filtering by company
 all_companies = sorted(list(set(m['company'] for m in bot.metadata)))
 selected_companies = st.multiselect(
     "Filter by Company (optional):",
@@ -290,7 +296,6 @@ ANSWER:
 """
                 answer, model_used = bot.generate_with_gemini(prompt)
                 
-                # Highlight numbers and percentages
                 answer = highlight_numbers(answer)
 
                 st.session_state.history.append((query, answer, chunks))
@@ -316,4 +321,3 @@ if st.session_state.history:
                 st.markdown(sources_str)
         
         st.markdown("---")
-
