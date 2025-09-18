@@ -306,20 +306,27 @@ ANSWER:
                 st.session_state.history.append((query, answer, chunks))
 
 # =========================
-# FINANCIAL EXTRACTION TO CSV
+# FINANCIAL EXTRACTION TO CSV (STREAMING)
 # =========================
+import pandas as pd
+
 st.markdown("---")
 if st.button("📥 Extract Financials to CSV"):
     if not bot.metadata:
         st.warning("Please upload at least one financial report first.")
     else:
         with st.spinner("Extracting structured financials..."):
-            context_with_sources = "\n\n".join([
-                f"--- Source: {chunk['company']} ---\n{chunk['content']}"
-                for chunk in bot.metadata[:50]  # limit for performance
-            ])
+            batch_size = 20  # process chunks in groups of 20
+            extracted_records = []
 
-            extraction_prompt = f"""
+            for start in range(0, len(bot.metadata), batch_size):
+                end = start + batch_size
+                context_with_sources = "\n\n".join([
+                    f"--- Source: {chunk['company']} ---\n{chunk['content']}"
+                    for chunk in bot.metadata[start:end]
+                ])
+
+                extraction_prompt = f"""
 You are a financial data extractor. From the context below, identify key financial metrics.
 Return ONLY valid JSON with this schema:
 [
@@ -335,16 +342,31 @@ Return ONLY valid JSON with this schema:
   }}
 ]
 
+If no financials are found in this context, return an empty list [].
+Do not include explanations or markdown formatting.
+
 CONTEXT:
 {context_with_sources}
 """
 
-            raw_json, _ = bot.generate_with_gemini(extraction_prompt, max_tokens=800)
+                raw_json, _ = bot.generate_with_gemini(extraction_prompt, max_tokens=800)
 
-            try:
-                data = json.loads(raw_json)
-                df = pd.DataFrame(data)
-                st.success("✅ Extracted financials successfully!")
+                try:
+                    # 🔑 Strip markdown fences if Gemini adds them
+                    cleaned = raw_json.strip()
+                    if cleaned.startswith("```"):
+                        cleaned = re.sub(r"^```(json)?", "", cleaned, flags=re.IGNORECASE).strip()
+                        cleaned = re.sub(r"```$", "", cleaned).strip()
+
+                    data = json.loads(cleaned)
+                    if isinstance(data, list):
+                        extracted_records.extend(data)
+                except Exception as e:
+                    st.warning(f"⚠️ Skipped batch {start}-{end} due to parse error: {str(e)}")
+
+            if extracted_records:
+                df = pd.DataFrame(extracted_records).drop_duplicates()
+                st.success(f"✅ Extracted {len(df)} financial records!")
 
                 st.dataframe(df)
 
@@ -355,10 +377,8 @@ CONTEXT:
                     file_name="financials.csv",
                     mime="text/csv",
                 )
-            except Exception as e:
-                st.error(f"❌ Failed to parse financial data: {str(e)}")
-                st.text("Raw output:")
-                st.code(raw_json)
+            else:
+                st.error("❌ No financials could be extracted.")
 
 # =========================
 # CHAT HISTORY
