@@ -6,3 +6,4 @@ torch
 pdfminer.six
 requests
 google-generativeai
+langchain
