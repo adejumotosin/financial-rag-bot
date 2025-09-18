@@ -306,7 +306,7 @@ ANSWER:
                 st.session_state.history.append((query, answer, chunks))
 
 # =========================
-# FINANCIAL EXTRACTION TO CSV (STREAMING)
+# FINANCIAL EXTRACTION TO CSV (ROBUST)
 # =========================
 import pandas as pd
 
@@ -316,7 +316,7 @@ if st.button("📥 Extract Financials to CSV"):
         st.warning("Please upload at least one financial report first.")
     else:
         with st.spinner("Extracting structured financials..."):
-            batch_size = 20  # process chunks in groups of 20
+            batch_size = 20
             extracted_records = []
 
             for start in range(0, len(bot.metadata), batch_size):
@@ -327,23 +327,24 @@ if st.button("📥 Extract Financials to CSV"):
                 ])
 
                 extraction_prompt = f"""
-You are a financial data extractor. From the context below, identify key financial metrics.
-Return ONLY valid JSON with this schema:
+You are a financial data extractor. From the context below, extract ONLY structured financial metrics.
+
+⚠️ OUTPUT STRICTLY AS JSON — no markdown, no explanations. 
+If no data is found, return [].
+
+Schema:
 [
   {{
     "Company": "string",
     "Quarter": "string",
-    "Revenue": "number (in billions if possible)",
-    "OperatingIncome": "number",
-    "OperatingMargin": "percentage",
-    "NetIncome": "number",
-    "EPS": "number",
-    "ComparableEPS": "number"
+    "Revenue": number,
+    "OperatingIncome": number,
+    "OperatingMargin": number,
+    "NetIncome": number,
+    "EPS": number,
+    "ComparableEPS": number
   }}
 ]
-
-If no financials are found in this context, return an empty list [].
-Do not include explanations or markdown formatting.
 
 CONTEXT:
 {context_with_sources}
@@ -352,17 +353,36 @@ CONTEXT:
                 raw_json, _ = bot.generate_with_gemini(extraction_prompt, max_tokens=800)
 
                 try:
-                    # 🔑 Strip markdown fences if Gemini adds them
                     cleaned = raw_json.strip()
+
+                    # Remove markdown fences if present
                     if cleaned.startswith("```"):
                         cleaned = re.sub(r"^```(json)?", "", cleaned, flags=re.IGNORECASE).strip()
                         cleaned = re.sub(r"```$", "", cleaned).strip()
 
+                    # Try to parse JSON
                     data = json.loads(cleaned)
+
+                    # ✅ Ensure it's a list
+                    if isinstance(data, dict):
+                        data = [data]
                     if isinstance(data, list):
                         extracted_records.extend(data)
+
                 except Exception as e:
-                    st.warning(f"⚠️ Skipped batch {start}-{end} due to parse error: {str(e)}")
+                    # 🔄 Attempt auto-repair using regex
+                    try:
+                        match = re.search(r".*", cleaned, re.DOTALL)
+                        if match:
+                            data = json.loads(match.group(0))
+                            if isinstance(data, dict):
+                                data = [data]
+                            if isinstance(data, list):
+                                extracted_records.extend(data)
+                        else:
+                            st.warning(f"⚠️ Batch {start}-{end} returned invalid JSON.")
+                    except Exception:
+                        st.warning(f"⚠️ Skipped batch {start}-{end} (parse error).")
 
             if extracted_records:
                 df = pd.DataFrame(extracted_records).drop_duplicates()
