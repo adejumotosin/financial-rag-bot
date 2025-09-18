@@ -306,7 +306,7 @@ ANSWER:
                 st.session_state.history.append((query, answer, chunks))
 
 # =========================
-# FINANCIAL EXTRACTION TO CSV (ROBUST)
+# FINANCIAL EXTRACTION TO CSV (HARDENED)
 # =========================
 import pandas as pd
 
@@ -318,6 +318,7 @@ if st.button("📥 Extract Financials to CSV"):
         with st.spinner("Extracting structured financials..."):
             batch_size = 20
             extracted_records = []
+            debug_outputs = []  # store raw outputs for inspection
 
             for start in range(0, len(bot.metadata), batch_size):
                 end = start + batch_size
@@ -327,10 +328,11 @@ if st.button("📥 Extract Financials to CSV"):
                 ])
 
                 extraction_prompt = f"""
-You are a financial data extractor. From the context below, extract ONLY structured financial metrics.
+You are a financial data extractor. 
+From the context below, extract ONLY structured financial metrics.
 
-⚠️ OUTPUT STRICTLY AS JSON — no markdown, no explanations. 
-If no data is found, return [].
+⚠️ OUTPUT STRICTLY AS VALID JSON.
+NO markdown, no explanations, no prose.
 
 Schema:
 [
@@ -346,48 +348,45 @@ Schema:
   }}
 ]
 
+If nothing is found, return [].
+
 CONTEXT:
 {context_with_sources}
 """
 
-                raw_json, _ = bot.generate_with_gemini(extraction_prompt, max_tokens=800)
+                raw_output, _ = bot.generate_with_gemini(extraction_prompt, max_tokens=800)
+                debug_outputs.append((f"Batch {start}-{end}", raw_output))
 
                 try:
-                    cleaned = raw_json.strip()
+                    cleaned = raw_output.strip()
 
                     # Remove markdown fences if present
                     if cleaned.startswith("```"):
                         cleaned = re.sub(r"^```(json)?", "", cleaned, flags=re.IGNORECASE).strip()
                         cleaned = re.sub(r"```$", "", cleaned).strip()
 
-                    # Try to parse JSON
+                    # Regex fallback: try to grab the JSON array
+                    if not cleaned.startswith("["):
+                        match = re.search(r".*", cleaned, re.DOTALL)
+                        if match:
+                            cleaned = match.group(0)
+
+                    # Parse JSON
                     data = json.loads(cleaned)
 
-                    # ✅ Ensure it's a list
+                    # Normalize to list
                     if isinstance(data, dict):
                         data = [data]
+
                     if isinstance(data, list):
                         extracted_records.extend(data)
 
-                except Exception as e:
-                    # 🔄 Attempt auto-repair using regex
-                    try:
-                        match = re.search(r".*", cleaned, re.DOTALL)
-                        if match:
-                            data = json.loads(match.group(0))
-                            if isinstance(data, dict):
-                                data = [data]
-                            if isinstance(data, list):
-                                extracted_records.extend(data)
-                        else:
-                            st.warning(f"⚠️ Batch {start}-{end} returned invalid JSON.")
-                    except Exception:
-                        st.warning(f"⚠️ Skipped batch {start}-{end} (parse error).")
+                except Exception:
+                    st.warning(f"⚠️ Batch {start}-{end} could not be parsed.")
 
             if extracted_records:
                 df = pd.DataFrame(extracted_records).drop_duplicates()
                 st.success(f"✅ Extracted {len(df)} financial records!")
-
                 st.dataframe(df)
 
                 csv = df.to_csv(index=False).encode("utf-8")
@@ -399,6 +398,12 @@ CONTEXT:
                 )
             else:
                 st.error("❌ No financials could be extracted.")
+
+            # Debug expander to inspect raw outputs
+            with st.expander("🐞 Debug: Show Raw Gemini Outputs"):
+                for batch_name, output in debug_outputs:
+                    st.markdown(f"**{batch_name}:**")
+                    st.code(output)
 
 # =========================
 # CHAT HISTORY
