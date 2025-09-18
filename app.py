@@ -14,7 +14,7 @@ import json
 import base64
 from typing import Dict, List, Tuple, Optional
 
-==== CONFIG ====
+#==== CONFIG ====
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2" INDEX_PATH = "financial_index/faiss_index.bin" METADATA_PATH = "financial_index/metadata.pkl" EMBEDDING_CACHE_PATH = "financial_index/embedding_cache.pkl" GEMINI_MODELS = ["gemini-1.5-pro", "gemini-1.5-flash"]  # Fallback hierarchy CHUNK_SIZE = 5 OVERLAP = 1
 
