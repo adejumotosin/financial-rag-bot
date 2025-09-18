@@ -37,6 +37,9 @@ class FinancialRAGBot:
         self.embedding_cache = {}
         self.index = None
 
+        # --- FIX: Create the directory if it doesn't exist ---
+        os.makedirs("financial_index", exist_ok=True)
+
         if os.path.exists(METADATA_PATH):
             with open(METADATA_PATH, "rb") as f:
                 self.metadata = pickle.load(f)
