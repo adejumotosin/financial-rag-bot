@@ -1,3 +1,6 @@
+# =========================
+# IMPORTS
+# =========================
 import streamlit as st
 import numpy as np
 import faiss
@@ -15,19 +18,17 @@ import hashlib
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from typing import List, Dict, Any
 
-
 # =========================
 # CONFIG
 # =========================
-
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 INDEX_PATH = "financial_index/faiss_index.bin"
 METADATA_PATH = "financial_index/metadata.pkl"
 EMBEDDING_CACHE_PATH = "financial_index/embedding_cache.pkl"
 
 LLM_MODELS = [
-    "claude-3-opus-20240229",    # Anthropic Claude 3 Opus
-    "gemini-1.5-pro-latest",     # Google Gemini Pro
+    "claude-3-opus-20240229",   # Anthropic Claude 3 Opus
+    "gemini-1.5-pro-latest"     # Google Gemini Pro
 ]
 
 CHUNK_SIZE = 1000
@@ -37,12 +38,11 @@ OVERLAP = 200
 # =========================
 # FINANCIAL RAG BOT CLASS
 # =========================
-
 class FinancialRAGBot:
     def __init__(self, api_keys: Dict[str, str]):
         if api_keys.get("google"):
             genai.configure(api_key=api_keys["google"])
-
+        
         self.anthropic_client = None
         if api_keys.get("anthropic"):
             import anthropic
@@ -58,41 +58,39 @@ class FinancialRAGBot:
         if os.path.exists(METADATA_PATH):
             with open(METADATA_PATH, "rb") as f:
                 self.metadata = pickle.load(f)
-
         if os.path.exists(EMBEDDING_CACHE_PATH):
             with open(EMBEDDING_CACHE_PATH, "rb") as f:
                 self.embedding_cache = pickle.load(f)
-
         if os.path.exists(INDEX_PATH):
             self.index = faiss.read_index(INDEX_PATH)
 
     def generate_with_llm(self, prompt: str, max_tokens=2000):
-    """Try LLMs in fallback order (Claude → Gemini)."""
-    for model_name in LLM_MODELS:
-        try:
-            if model_name.startswith("claude-") and self.anthropic_client:
-                response = self.anthropic_client.messages.create(
-                    model=model_name,
-                    max_tokens=max_tokens,
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                return response.content[0].text, model_name
+        """Try LLMs in fallback order (Claude → Gemini)."""
+        for model_name in LLM_MODELS:
+            try:
+                if model_name.startswith("claude-") and self.anthropic_client:
+                    response = self.anthropic_client.messages.create(
+                        model=model_name,
+                        max_tokens=max_tokens,
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+                    return response.content[0].text, model_name
 
-            elif model_name.startswith("gemini-") and getattr(genai, "api_key", None):
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(
-                    prompt,
-                    generation_config={"max_output_tokens": max_tokens}
-                )
-                if response and response.candidates:
-                    text = getattr(response, "text", None) or response.candidates[0].content.parts[0].text
-                    return text, model_name
+                elif model_name.startswith("gemini-") and getattr(genai, "api_key", None):
+                    model = genai.GenerativeModel(model_name)
+                    response = model.generate_content(
+                        prompt, 
+                        generation_config={"max_output_tokens": max_tokens}
+                    )
+                    if response and response.candidates:
+                        text = getattr(response, "text", None) or response.candidates[0].content.parts[0].text
+                        return text, model_name
 
-        except Exception as e:
-            st.warning(f"⚠️ Error with {model_name}: {e}")
-            continue
+            except Exception as e:
+                st.warning(f"⚠️ Error with {model_name}: {e}")
+                continue
 
-    return "", None
+        return "", None
 
     def add_document(self, file, company: str):
         text = extract_text(file)
@@ -152,6 +150,7 @@ Rules:
 
 TEXT: {full_text}
 """
+
         text, model_used = self.generate_with_llm(prompt, max_tokens=2000)
         if not text:
             st.warning("⚠️ No text returned by LLM.")
@@ -160,7 +159,6 @@ TEXT: {full_text}
         try:
             cleaned = re.sub(r"```json|```", "", text).strip()
             parsed = json.loads(cleaned)
-
             if not isinstance(parsed, dict):
                 st.warning("⚠️ Unexpected JSON format.")
                 return pd.DataFrame()
@@ -182,7 +180,7 @@ TEXT: {full_text}
                 if val is not None:
                     try:
                         data[key] = float(val)
-                    except Exception:
+                    except:
                         errors.append(f"{key} invalid number: {val}")
                         data[key] = None
 
@@ -203,13 +201,11 @@ TEXT: {full_text}
 # =========================
 # STREAMLIT UI
 # =========================
-
 st.set_page_config(page_title="📊 Financial Report RAG Bot", layout="wide")
 
 st.title("📊 Financial Report RAG Bot")
 st.caption("Upload financial PDFs and extract structured data with Claude/Gemini.")
 
-# Sidebar
 st.sidebar.subheader("🔑 API Keys")
 google_api_key = st.sidebar.text_input("Google Gemini API Key", type="password")
 anthropic_api_key = st.sidebar.text_input("Anthropic Claude API Key", type="password")
@@ -220,45 +216,40 @@ if google_api_key:
 if anthropic_api_key:
     api_keys["anthropic"] = anthropic_api_key
 
-bot = FinancialRAGBot(api_keys) if api_keys else None
+if api_keys:
+    bot = FinancialRAGBot(api_keys)
 
-# Document management
-st.subheader("⚙️ Document Management")
-uploaded = st.file_uploader("📂 Upload Financial PDF", type=["pdf"])
+    st.subheader("⚙️ Document Management")
+    uploaded = st.file_uploader("📂 Upload Financial PDF", type=["pdf"])
 
-if uploaded and bot:
-    company_name = st.text_input("🏷️ Company Name", value=uploaded.name.split(".")[0])
-    if st.button("Process Document"):
-        if not bot.anthropic_client and not genai.is_configured():
-            st.error("Please provide at least one LLM API key.")
-        else:
-            bot.add_document(uploaded, company_name)
-            st.success(f"✅ Processed {uploaded.name} for {company_name}")
-
-# Extraction
-if bot and bot.metadata:
-    st.subheader("📊 Extract Financials")
-    company_for_extract = st.selectbox(
-        "Select company to extract:",
-        sorted(set(m["company"] for m in bot.metadata))
-    )
-
-    if st.button("📤 Extract Financials to CSV"):
-        if not bot.anthropic_client and not genai.is_configured():
-            st.error("Please configure an API key to extract financials.")
-        else:
-            df = bot.extract_financials(company_for_extract)
-            if not df.empty:
-                st.dataframe(df)
-                csv = df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "📥 Download CSV",
-                    data=csv,
-                    file_name=f"{company_for_extract}_financials.csv",
-                    mime="text/csv"
-                )
+    if uploaded:
+        company_name = st.text_input("🏷️ Company Name", value=uploaded.name.split(".")[0])
+        if st.button("Process Document"):
+            if not bot.anthropic_client and not getattr(genai, "api_key", None):
+                st.error("Please provide at least one LLM API key.")
             else:
-                st.error("❌ No valid financials could be extracted.")
+                bot.add_document(uploaded, company_name)
+                st.success(f"✅ Processed {uploaded.name} for {company_name}")
 
-elif not api_keys:
+    if bot.metadata:
+        st.subheader("📊 Extract Financials")
+        company_for_extract = st.selectbox("Select company to extract:", sorted(set(m["company"] for m in bot.metadata)))
+
+        if st.button("📤 Extract Financials to CSV"):
+            if not bot.anthropic_client and not getattr(genai, "api_key", None):
+                st.error("Please configure an API key to extract financials.")
+            else:
+                df = bot.extract_financials(company_for_extract)
+                if not df.empty:
+                    st.dataframe(df)
+                    csv = df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "📥 Download CSV", 
+                        data=csv, 
+                        file_name=f"{company_for_extract}_financials.csv", 
+                        mime="text/csv"
+                    )
+                else:
+                    st.error("❌ No valid financials could be extracted.")
+else:
     st.info("Please enter at least one LLM API key in the sidebar to begin.")
