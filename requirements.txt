@@ -1,10 +1,22 @@
-streamlit
-numpy
-pandas
-faiss-cpu
-sentence-transformers
-pdfminer.six
-google-generativeai
-langchain
-xlsxwriter
-streamlit>=1.28
+# Core
+streamlit==1.37.0
+numpy==1.26.4
+pandas==2.2.2
+
+# Embeddings & NLP
+sentence-transformers==2.7.0
+faiss-cpu==1.7.4
+
+# PDF parsing
+pdfminer.six==20221105
+
+# Langchain for text splitting
+langchain==0.2.1
+langchain-core==0.2.1
+
+# Gemini API
+google-generativeai==0.7.2
+
+# Utilities
+tqdm==4.66.4
+protobuf==4.25.3
