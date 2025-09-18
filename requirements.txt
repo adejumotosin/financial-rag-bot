@@ -7,3 +7,4 @@ pdfminer.six
 google-generativeai
 langchain
 xlsxwriter
+streamlit>=1.28
