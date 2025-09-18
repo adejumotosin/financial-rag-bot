@@ -1,22 +1,10 @@
- # Core
 streamlit
 numpy
-pandas
-
-# Embeddings & NLP
-sentence-transformers
 faiss-cpu
-
-# PDF parsing
+pickle-mixin
+pandas
 pdfminer.six
-
-# Langchain for text splitting
-langchain
-langchain-core
-
-# Gemini API
+sentence-transformers
 google-generativeai
-
-# Utilities
-tqdm
-protobuf
+anthropic
+langchain
