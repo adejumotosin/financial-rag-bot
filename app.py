@@ -1,6 +1,3 @@
-# =========================
-# IMPORTS
-# =========================
 import streamlit as st
 import numpy as np
 import faiss
@@ -28,9 +25,8 @@ EMBEDDING_CACHE_PATH = "financial_index/embedding_cache.pkl"
 
 LLM_MODELS = [
     "claude-3-opus-20240229",   # Anthropic Claude 3 Opus
-    "gemini-1.5-pro-latest"     # Google Gemini Pro
+    "gemini-1.5-pro-latest",    # Google Gemini Pro
 ]
-
 CHUNK_SIZE = 1000
 OVERLAP = 200
 
@@ -40,13 +36,18 @@ OVERLAP = 200
 # =========================
 class FinancialRAGBot:
     def __init__(self, api_keys: Dict[str, str]):
+        self.has_gemini = False
+        self.has_claude = False
+
         if api_keys.get("google"):
             genai.configure(api_key=api_keys["google"])
-        
+            self.has_gemini = True
+
         self.anthropic_client = None
         if api_keys.get("anthropic"):
             import anthropic
             self.anthropic_client = anthropic.Anthropic(api_key=api_keys["anthropic"])
+            self.has_claude = True
 
         self.model = SentenceTransformer(EMBEDDING_MODEL)
         self.metadata = []
@@ -68,7 +69,7 @@ class FinancialRAGBot:
         """Try LLMs in fallback order (Claude → Gemini)."""
         for model_name in LLM_MODELS:
             try:
-                if model_name.startswith("claude-") and self.anthropic_client:
+                if model_name.startswith("claude-") and self.has_claude:
                     response = self.anthropic_client.messages.create(
                         model=model_name,
                         max_tokens=max_tokens,
@@ -76,10 +77,10 @@ class FinancialRAGBot:
                     )
                     return response.content[0].text, model_name
 
-                elif model_name.startswith("gemini-") and getattr(genai, "api_key", None):
+                elif model_name.startswith("gemini-") and self.has_gemini:
                     model = genai.GenerativeModel(model_name)
                     response = model.generate_content(
-                        prompt, 
+                        prompt,
                         generation_config={"max_output_tokens": max_tokens}
                     )
                     if response and response.candidates:
@@ -150,7 +151,6 @@ Rules:
 
 TEXT: {full_text}
 """
-
         text, model_used = self.generate_with_llm(prompt, max_tokens=2000)
         if not text:
             st.warning("⚠️ No text returned by LLM.")
@@ -225,7 +225,7 @@ if api_keys:
     if uploaded:
         company_name = st.text_input("🏷️ Company Name", value=uploaded.name.split(".")[0])
         if st.button("Process Document"):
-            if not bot.anthropic_client and not getattr(genai, "api_key", None):
+            if not bot.has_claude and not bot.has_gemini:
                 st.error("Please provide at least one LLM API key.")
             else:
                 bot.add_document(uploaded, company_name)
@@ -233,10 +233,13 @@ if api_keys:
 
     if bot.metadata:
         st.subheader("📊 Extract Financials")
-        company_for_extract = st.selectbox("Select company to extract:", sorted(set(m["company"] for m in bot.metadata)))
+        company_for_extract = st.selectbox(
+            "Select company to extract:",
+            sorted(set(m["company"] for m in bot.metadata))
+        )
 
         if st.button("📤 Extract Financials to CSV"):
-            if not bot.anthropic_client and not getattr(genai, "api_key", None):
+            if not bot.has_claude and not bot.has_gemini:
                 st.error("Please configure an API key to extract financials.")
             else:
                 df = bot.extract_financials(company_for_extract)
@@ -244,9 +247,9 @@ if api_keys:
                     st.dataframe(df)
                     csv = df.to_csv(index=False).encode("utf-8")
                     st.download_button(
-                        "📥 Download CSV", 
-                        data=csv, 
-                        file_name=f"{company_for_extract}_financials.csv", 
+                        "📥 Download CSV",
+                        data=csv,
+                        file_name=f"{company_for_extract}_financials.csv",
                         mime="text/csv"
                     )
                 else:
