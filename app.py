@@ -3,7 +3,8 @@ import numpy as np
 import faiss import pickle 
 import os from io 
 import BytesIO 
-from pdfminer.high_level import extract_text from sentence_transformers import SentenceTransformer 
+from pdfminer.high_level import extract_text
+from sentence_transformers import SentenceTransformer 
 import google.generativeai as genai 
 import re 
 from datetime import datetime 
