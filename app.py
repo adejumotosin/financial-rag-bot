@@ -3,17 +3,16 @@ import numpy as np
 import faiss
 import pickle
 import os
-import re
-import hashlib
-import json
-import requests
 from io import BytesIO
 from pdfminer.high_level import extract_text
 from sentence_transformers import SentenceTransformer
-from typing import List, Dict, Any, Optional
+import re
+import hashlib
+import json
 import logging
 from datetime import datetime
 import google.generativeai as genai
+from typing import List, Dict, Any, Optional
 
 # ==== CONFIG ====
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -21,16 +20,14 @@ INDEX_PATH = "financial_index/faiss_index.bin"
 METADATA_PATH = "financial_index/metadata.pkl"
 HASHES_PATH = "financial_index/content_hashes.pkl"
 
-# Gemini setup
-GEMINI_MODEL_PRIMARY = "gemini-1.5-flash"
-GEMINI_MODEL_FALLBACK = "gemini-1.5-pro"
+# API key setup
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==== INIT ====
+# ==== INIT STREAMLIT ====
 st.set_page_config(
     page_title="📊 Financial Report RAG Bot",
     page_icon="📉",
@@ -51,14 +48,13 @@ def load_index():
         try:
             index = faiss.read_index(INDEX_PATH)
             if index.d != dim:
-                logger.warning("Index dim mismatch, creating new index.")
+                logger.warning("Index dimension mismatch, creating new index.")
                 return faiss.IndexFlatL2(dim)
             return index
         except Exception as e:
             logger.error(f"Error loading index: {e}")
             return faiss.IndexFlatL2(dim)
-    else:
-        return faiss.IndexFlatL2(dim)
+    return faiss.IndexFlatL2(dim)
 
 def load_metadata():
     try:
@@ -75,7 +71,7 @@ def load_content_hashes():
             with open(HASHES_PATH, "rb") as f:
                 return pickle.load(f)
     except Exception as e:
-        logger.error(f"Error loading content hashes: {e}")
+        logger.error(f"Error loading hashes: {e}")
     return set()
 
 def save_content_hashes(hashes: set):
@@ -83,9 +79,9 @@ def save_content_hashes(hashes: set):
         with open(HASHES_PATH, "wb") as f:
             pickle.dump(hashes, f)
     except Exception as e:
-        logger.error(f"Error saving content hashes: {e}")
+        logger.error(f"Error saving hashes: {e}")
 
-# Initialize
+# Load state
 model = load_model()
 index = load_index()
 metadata = load_metadata()
@@ -102,8 +98,7 @@ def clean_text(text: str) -> str:
 
 def create_smart_chunks(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
     sentences = text.split('. ')
-    chunks = []
-    current_chunk = ""
+    chunks, current_chunk = [], ""
     for sentence in sentences:
         if len(current_chunk) + len(sentence) < chunk_size:
             current_chunk += sentence + ". "
@@ -136,12 +131,29 @@ def retrieve(query: str, top_k: int = 5, company_filter: Optional[str] = None) -
         results.sort(key=lambda x: x['score'])
         return results[:top_k]
     except Exception as e:
-        logger.error(f"Error in retrieval: {e}")
+        logger.error(f"Retrieval error: {e}")
         return []
 
+# ==== GEMINI GENERATION ====
 def generate_with_gemini(prompt: str, max_tokens: int = 500) -> str:
+    """Generate text with Gemini, clean formatting, bullet points for financial metrics."""
+    def clean_and_format(text: str) -> str:
+        cleaned = (
+            text.replace("\n", " ")
+            .replace("  ", " ")
+            .replace(" ,", ",")
+            .replace(" .", ".")
+            .strip()
+        )
+        sentences = [s.strip() for s in cleaned.split(".") if s.strip()]
+        if any(word in cleaned.lower() for word in ["revenue", "income", "growth", "margin", "eps", "%"]):
+            formatted = "\n".join([f"- {s}." for s in sentences])
+            return formatted
+        return cleaned
+
     try:
-        response = genai.GenerativeModel(GEMINI_MODEL_PRIMARY).generate_content(
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content(
             prompt,
             generation_config={
                 "temperature": 0.7,
@@ -149,33 +161,31 @@ def generate_with_gemini(prompt: str, max_tokens: int = 500) -> str:
                 "max_output_tokens": max_tokens,
             },
         )
-        return response.text
-    except Exception as e:
-        err_msg = str(e)
-        if "429" in err_msg or "quota" in err_msg.lower():
-            try:
-                response = genai.GenerativeModel(GEMINI_MODEL_FALLBACK).generate_content(
-                    prompt,
-                    generation_config={
-                        "temperature": 0.7,
-                        "top_p": 0.9,
-                        "max_output_tokens": max_tokens,
-                    },
-                )
-                return response.text
-            except Exception as e2:
-                return f"❌ Gemini fallback (Pro) failed: {e2}"
-        return f"❌ Gemini error: {e}"
+        return clean_and_format(response.text)
+    except Exception:
+        try:
+            model = genai.GenerativeModel("gemini-1.5-pro")
+            response = model.generate_content(
+                prompt,
+                generation_config={
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "max_output_tokens": max_tokens,
+                },
+            )
+            return clean_and_format(response.text)
+        except Exception as e2:
+            return f"❌ Gemini fallback failed: {e2}"
 
+# ==== PDF PROCESS ====
 def process_pdf(file, company: str = "unknown") -> Dict[str, int]:
     try:
         text = extract_text(file)
         text = clean_text(text)
         if len(text.strip()) < 100:
-            return {"added": 0, "duplicates": 0, "error": "PDF empty or unreadable."}
+            return {"added": 0, "duplicates": 0, "error": "PDF appears empty"}
         chunks = create_smart_chunks(text)
-        new_chunks = []
-        duplicate_count = 0
+        new_chunks, duplicate_count = [], 0
         for chunk in chunks:
             chunk_hash = get_content_hash(chunk)
             if chunk_hash not in content_hashes:
@@ -183,10 +193,7 @@ def process_pdf(file, company: str = "unknown") -> Dict[str, int]:
                 content_hashes.add(chunk_hash)
             else:
                 duplicate_count += 1
-        if not new_chunks:
-            return {"added": 0, "duplicates": duplicate_count, "error": "All chunks were duplicates."}
-        batch_size = 32
-        added_count = 0
+        batch_size, added_count = 32, 0
         for i in range(0, len(new_chunks), batch_size):
             batch_chunks = new_chunks[i:i + batch_size]
             vectors = model.encode(batch_chunks)
@@ -209,31 +216,12 @@ def process_pdf(file, company: str = "unknown") -> Dict[str, int]:
         logger.error(f"PDF processing error: {e}")
         return {"added": 0, "duplicates": 0, "error": str(e)}
 
-def export_chat_history() -> str:
-    if not st.session_state.history:
-        return "No chat history available."
-    export_text = "Financial RAG Bot - Chat History\n"
-    export_text += f"Exported on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-    export_text += "=" * 50 + "\n\n"
-    for i, (query, answer, chunks) in enumerate(st.session_state.history, 1):
-        export_text += f"Question {i}: {query}\n"
-        export_text += f"Answer {i}: {answer}\n"
-        export_text += f"Sources: {len(chunks)} chunks from {', '.join(set(c.get('company', 'N/A') for c in chunks))}\n"
-        export_text += "-" * 30 + "\n\n"
-    return export_text
-
-# ==== SESSION STATE ====
+# ==== STREAMLIT UI ====
 if "history" not in st.session_state:
     st.session_state.history = []
 
-# ==== SIDEBAR ====
 st.sidebar.title("⚙️ Financial Docs Management")
-
-uploaded = st.sidebar.file_uploader(
-    "Upload Financial PDF(s)",
-    type="pdf",
-    accept_multiple_files=True
-)
+uploaded = st.sidebar.file_uploader("Upload Financial PDF(s)", type="pdf", accept_multiple_files=True)
 company_tag = st.sidebar.text_input("🏷️ Company Name", placeholder="e.g., Apple Inc.")
 
 if uploaded:
@@ -253,52 +241,32 @@ if uploaded:
         if result["duplicates"] > 0:
             st.sidebar.info(f"ℹ️ {file.name}: {result['duplicates']} duplicates skipped")
     status_text.text("Processing complete!")
-    st.sidebar.success(f"📊 Total: {total_added} new chunks, {total_duplicates} duplicates skipped")
+    st.sidebar.success(f"📊 Total: {total_added} new, {total_duplicates} duplicates")
 
 st.sidebar.subheader("🗄️ Index Management")
 st.sidebar.metric("Total Chunks", len(metadata))
 st.sidebar.metric("Index Size", f"{index.ntotal if hasattr(index, 'ntotal') else 0}")
 companies = list(set([item.get('company', 'unknown') for item in metadata]))
 if companies:
-    st.sidebar.write(f"🏢 **Companies ({len(companies)}):**")
-    st.sidebar.write(", ".join(sorted(companies)))
+    st.sidebar.write(f"🏢 Companies: {', '.join(sorted(companies))}")
+if st.sidebar.button("🧹 Reset Index"):
+    try:
+        for path in [INDEX_PATH, METADATA_PATH, HASHES_PATH]:
+            if os.path.exists(path): os.remove(path)
+        index.reset(); metadata.clear(); content_hashes.clear(); st.session_state.history.clear()
+        st.sidebar.success("✅ Index reset!")
+        st.rerun()
+    except Exception as e:
+        st.sidebar.error(f"❌ Error resetting: {e}")
 
-if st.sidebar.button("🧹 Reset Index", type="secondary"):
-    for path in [INDEX_PATH, METADATA_PATH, HASHES_PATH]:
-        if os.path.exists(path):
-            os.remove(path)
-    index.reset()
-    metadata.clear()
-    content_hashes.clear()
-    st.session_state.history.clear()
-    st.sidebar.success("✅ Index completely reset!")
-    st.rerun()
-
-st.sidebar.subheader("📥 Export Options")
-if st.session_state.history:
-    chat_export = export_chat_history()
-    st.sidebar.download_button(
-        label="💾 Download Chat History",
-        data=chat_export,
-        file_name=f"chat_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-        mime="text/plain"
-    )
-
-st.sidebar.subheader("🎛️ Search Options")
-company_filter = st.sidebar.selectbox("Filter by Company", options=["All"] + sorted(companies), index=0)
-top_k = st.sidebar.slider("Results to retrieve", 1, 10, 5)
-
-# ==== MAIN INTERFACE ====
+# ==== MAIN ====
 st.title("📊 Financial Report RAG Bot")
-st.markdown("Upload PDF financial reports and ask questions. The bot retrieves chunks and answers with Gemini.")
+st.markdown("Upload financial PDFs and ask questions. Gemini will summarize with context.")
 
 col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric("📄 Documents", len(set(item.get('company', 'unknown') for item in metadata)))
-with col2:
-    st.metric("🧩 Chunks", len(metadata))
-with col3:
-    st.metric("💬 Questions Asked", len(st.session_state.history))
+with col1: st.metric("📄 Documents", len(set(item.get('company','unknown') for item in metadata)))
+with col2: st.metric("🧩 Chunks", len(metadata))
+with col3: st.metric("💬 Questions Asked", len(st.session_state.history))
 
 if len(metadata) == 0:
     st.warning("👈 Upload some PDF documents to get started!")
@@ -306,54 +274,35 @@ else:
     st.success(f"✅ Ready with {len(metadata)} chunks from {len(companies)} companies!")
 
 query = st.text_input("💬 Ask your question:", placeholder="e.g., What was the revenue growth in Q4?")
+
 if query and len(metadata) > 0:
     with st.spinner("🔍 Searching and generating answer..."):
-        filter_company = None if company_filter == "All" else company_filter
-        chunks = retrieve(query, top_k=top_k, company_filter=filter_company)
+        chunks = retrieve(query, top_k=5)
         if not chunks:
-            st.warning("🔍 No relevant information found.")
+            st.warning("No relevant information found.")
         else:
             context = "\n\n".join([f"[{chunk['company']}]: {chunk['content']}" for chunk in chunks])
-            prompt = f"""You are a financial analyst assistant. Use the provided context from financial documents to answer the question accurately.
+            prompt = f"""You are a financial analyst assistant. Use context from documents to answer.
 
 CONTEXT:
 {context}
 
 QUESTION: {query}
 
+INSTRUCTIONS:
+- Provide a clear, accurate, professional answer
+- Include financial metrics and percentages
+- If incomplete, note missing info
+- Summarize cleanly
+
 ANSWER:"""
-            answer = generate_with_gemini(prompt, max_tokens=300)
-            st.markdown(f"**Answer:** {answer}")
+            answer = generate_with_gemini(prompt, max_tokens=400)
+            st.markdown(f"**Answer:**\n\n{answer}")
             st.session_state.history.append((query, answer, chunks))
 
 if st.session_state.history:
-    latest_query, latest_answer, latest_chunks = st.session_state.history[-1]
-    with st.expander("📄 Sources Used", expanded=False):
-        for i, chunk in enumerate(latest_chunks, 1):
+    with st.expander("📄 Sources Used"):
+        for i, chunk in enumerate(st.session_state.history[-1][2], 1):
             relevance = "High" if chunk.get('score', 1) < 0.5 else "Medium" if chunk.get('score', 1) < 1.0 else "Low"
-            st.markdown(f"""
-            **Source {i}** - *{chunk.get('company', 'N/A')}*  
-            **Relevance:** {relevance} (Score: {chunk.get('score', 0):.3f})  
-            **Content:** {chunk['content'][:400]}{'...' if len(chunk['content']) > 400 else ''}
-            """)
-            if i < len(latest_chunks):
-                st.markdown("---")
-
-if len(st.session_state.history) > 1:
-    with st.expander(f"📚 Previous Questions ({len(st.session_state.history) - 1})", expanded=False):
-        for i, (q, a, chunks_used) in enumerate(reversed(st.session_state.history[:-1]), 1):
-            companies_used = set(c.get('company', 'N/A') for c in chunks_used)
-            st.markdown(f"**Q{len(st.session_state.history) - i}:** {q}")
-            st.markdown(f"**A:** {a[:200]}{'...' if len(a) > 200 else ''}")
-            st.markdown(f"*Sources: {len(chunks_used)} chunks from {', '.join(companies_used)}*")
-            st.markdown("---")
-
-st.markdown("---")
-st.markdown(f"""
-<div style='text-align: center; color: gray;'>
-<small>
-Financial RAG Bot v2.0 | Powered by FAISS, Sentence Transformers & Gemini<br/>
-Model: {EMBEDDING_MODEL} | Chunks: {len(metadata)} | Companies: {len(companies)}
-</small>
-</div>
-""", unsafe_allow_html=True)
+            st.markdown(f"**Source {i}** - *{chunk.get('company','N/A')}* | Relevance: {relevance}")
+            st.caption(chunk['content'][:300] + ("..." if len(chunk['content'])>300 else ""))
