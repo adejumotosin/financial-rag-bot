@@ -1,0 +1,8 @@
+streamlit
+numpy
+faiss-cpu
+sentence-transformers
+torch
+pdfminer.six
+requests
+google-generativeai
