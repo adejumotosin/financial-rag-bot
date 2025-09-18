@@ -331,4 +331,3 @@ csv_data = cleaned_df.to_csv(index=False).encode("utf-8")
             file_name="financials_comparisons.csv",
             mime="text/csv"
         )
-
