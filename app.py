@@ -37,7 +37,7 @@ class FinancialRAGBot:
         self.embedding_cache = {}
         self.index = None
 
-        # --- FIX: Create the directory if it doesn't exist ---
+        # Create the directory if it doesn't exist
         os.makedirs("financial_index", exist_ok=True)
 
         if os.path.exists(METADATA_PATH):
@@ -99,7 +99,6 @@ class FinancialRAGBot:
                 model = genai.GenerativeModel(model_name)
                 response = model.generate_content(prompt, generation_config={"max_output_tokens": max_tokens})
                 if response and response.candidates:
-                    # Sometimes .text is empty, so fallback to parts
                     text = getattr(response, "text", None) or response.candidates[0].content.parts[0].text
                     return text, model_name
             except Exception:
@@ -108,59 +107,63 @@ class FinancialRAGBot:
 
     def extract_financials(self, company: str):
         """Extract financial metrics into CSV-ready DataFrame."""
-        chunks = [m for m in self.metadata if m["company"] == company]
-        if not chunks:
+        # Retrieve all content for the specified company at once
+        full_text = " ".join([m["content"] for m in self.metadata if m["company"] == company])
+        
+        if not full_text:
             return pd.DataFrame()
 
-        all_data = []
-        debug_logs = []
-
-        for start in range(0, len(chunks), 20):
-            batch = chunks[start:start+20]
-            context = "\n\n".join(c["content"] for c in batch)
-
-            prompt = f"""
-Extract financial metrics from the following report text and return ONLY valid JSON.
-Do not include explanations or markdown.
+        prompt = f"""
+You are an expert financial analyst. Your task is to extract key financial metrics from the provided text of a financial report.
+Read the entire document carefully to find the most accurate and recent data.
+Return ONLY a single valid JSON object. Do not include any explanations, markdown, or commentary.
 
 Expected JSON schema:
-[
-  {{
-    "Company": "{company}",
-    "Quarter": "QX YYYY",
-    "Revenue": number,
-    "OperatingIncome": number,
-    "OperatingMargin": number,
-    "NetIncome": number,
-    "EPS": number,
-    "ComparableEPS": number
-  }}
-]
+{{
+  "Company": "{company}",
+  "Quarter": "Q[X] YYYY",
+  "Revenue": number,
+  "OperatingIncome": number,
+  "OperatingMargin": number,
+  "NetIncome": number,
+  "EPS": number,
+  "ComparableEPS": number
+}}
+
+Instructions for extraction:
+1.  Locate the values for the most recent quarter in the document.
+2.  Be careful with the units. The values should be in a consistent numerical format (e.g., 12500000000 instead of 12.5 billion).
+3.  If a specific value is not found, use `null` for that field. Do not make up a value.
+4.  Ensure the extracted data corresponds to the company "{company}" and its most recent quarter results.
 
 TEXT:
-{context}
+{full_text}
 """
 
-            text, model_used = self.generate_with_gemini(prompt, max_tokens=800)
-            debug_logs.append((start, text))
+        text, model_used = self.generate_with_gemini(prompt, max_tokens=1000)
+        
+        try:
+            cleaned_text = re.sub(r"```json|```", "", text).strip()
+            parsed_data = json.loads(cleaned_text)
+            
+            # Post-processing and validation
+            if isinstance(parsed_data, dict):
+                # Convert single dictionary to a list of one for DataFrame compatibility
+                parsed_data = [parsed_data]
+                
+                # Simple validation: ensure company name is correct and key metrics are not null
+                df = pd.DataFrame(parsed_data)
+                df = df[df['Company'] == company].dropna(subset=['Revenue', 'NetIncome'])
+                
+                if not df.empty:
+                    return df
+                    
+        except (json.JSONDecodeError, KeyError) as e:
+            st.warning(f"⚠️ Failed to parse JSON or validate data: {e}")
+            st.text_area("🐞 Debug: Raw Gemini Output", text, height=300)
 
-            try:
-                cleaned = re.sub(r"```json|```", "", text).strip()
-                parsed = json.loads(cleaned)
-                if isinstance(parsed, list):
-                    all_data.extend(parsed)
-            except Exception:
-                continue
-
-        if all_data:
-            df = pd.DataFrame(all_data).drop_duplicates()
-            return df
-        else:
-            st.warning("⚠️ No structured data parsed. Check debug logs below.")
-            with st.expander("🐞 Debug: Raw Gemini Outputs"):
-                for batch_id, raw in debug_logs:
-                    st.text_area(f"Batch {batch_id}", raw, height=200)
-            return pd.DataFrame()
+        st.warning("⚠️ No valid structured data could be extracted.")
+        return pd.DataFrame()
 
 # =========================
 # STREAMLIT UI
