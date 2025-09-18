@@ -203,4 +203,3 @@ query = st.text_input("💬 Ask your financial question:", placeholder="e.g., Q2
 with st.expander("🔧 Advanced Search Settings"): col1, col2 = st.columns(2) with col1: top_k = st.slider("Number of context chunks", 1, 10, 5) with col2: min_similarity = st.slider("Minimum similarity threshold", 0.0, 1.0, 0.3, 0.1)
 
 if query and len(metadata) > 0: with st.spinner("🔍 Searching and generating answer..."): chunks = retrieve(query, top_k=top_k, min_score=min_similarity) if not chunks: st.warning("⚠️ No relevant information found.") else: context = "\n\n".join([f"[{c['company']}] (Similarity: {c['similarity']:.2f}): {c['content']}" for c in chunks]) prompt = f"""You are a professional financial analyst assistant. Use the context to answer accurately.
-
