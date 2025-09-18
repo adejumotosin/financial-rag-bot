@@ -23,7 +23,7 @@ INDEX_PATH = "financial_index/faiss_index.bin"
 METADATA_PATH = "financial_index/metadata.pkl"
 EMBEDDING_CACHE_PATH = "financial_index/embedding_cache.pkl"
 GEMINI_MODELS = ["gemini-1.5-pro", "gemini-1.5-flash"]
-CHUNK_SIZE = 500  # Chunks are now character-based for RecursiveCharacterTextSplitter
+CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
 
 # =========================
@@ -66,7 +66,7 @@ def load_object(path: str, default: Any):
     return default
 
 # =========================
-# CACHED RESOURCE LOADERS
+# CACHED RESOURCE AND DATA LOADERS
 # =========================
 @st.cache_resource
 def load_embedding_model():
@@ -86,6 +86,14 @@ def initialize_gemini_clients():
         model_name: genai.GenerativeModel(model_name)
         for model_name in GEMINI_MODELS
     }
+
+@st.cache_data
+def load_metadata_cached():
+    return load_object(METADATA_PATH, [])
+
+@st.cache_data
+def load_embedding_cache_cached():
+    return load_object(EMBEDDING_CACHE_PATH, {})
 
 # =========================
 # CORE RAG BOT CLASS
@@ -130,7 +138,6 @@ class FinancialRAGBot:
         
         vectors = self._get_cached_embeddings(tuple(chunks), file_hash)
         
-        # Add to index and metadata
         for i, chunk in enumerate(chunks):
             self.index.add(np.array([vectors[i]]).astype("float32"))
             self.metadata.append({
@@ -202,8 +209,8 @@ def get_bot():
     """Initializes and returns the RAG bot, passing cached resources."""
     model = load_embedding_model()
     index = load_faiss_index()
-    metadata = load_object(METADATA_PATH, [])
-    embedding_cache = load_object(EMBEDDING_CACHE_PATH, {})
+    metadata = load_metadata_cached() # Now a cached function
+    embedding_cache = load_embedding_cache_cached() # Now a cached function
     gemini_clients = initialize_gemini_clients()
     return FinancialRAGBot(model, index, metadata, embedding_cache, gemini_clients)
 
@@ -225,7 +232,6 @@ if uploaded:
         result = bot.process_pdf(uploaded.read(), company=company_tag or uploaded.name)
         if result["success"]:
             st.sidebar.success(f"✅ Added {result['chunks']} chunks from '{uploaded.name}'")
-            # To refresh the list of companies, we need to rerun the app
             st.rerun()
         else:
             st.sidebar.error(f"❌ {result['error']}")
@@ -235,6 +241,7 @@ if st.sidebar.button("🧹 Reset Index"):
     if os.path.exists(METADATA_PATH): os.remove(METADATA_PATH)
     if os.path.exists(EMBEDDING_CACHE_PATH): os.remove(EMBEDDING_CACHE_PATH)
     st.cache_resource.clear()
+    st.cache_data.clear() # Clear data cache as well
     st.session_state.history.clear()
     st.rerun()
 
