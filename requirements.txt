@@ -8,3 +8,6 @@ sentence-transformers
 google-generativeai
 anthropic
 langchain
+requests
+transformers
+huggingface-hub
